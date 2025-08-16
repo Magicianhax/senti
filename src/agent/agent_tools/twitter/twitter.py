@@ -71,20 +71,41 @@ class Twitter:
 
         # Calculate interval in minutes between runs
         self.interval = 1440.0 / self.config.RUNS_PER_DAY
+        
+        # Track runs for posting frequency
+        self.run_count = 0
 
         logging.info(f"[TWITTER] Connected to twitter user @{self.username} with id {self.user_id}.")
         
         if not self.config.KEY_USERS:
-            raise Exception("[TWITTER] You need to configure your twitter agent's key users")
+            logging.warning("[TWITTER] No key users configured - will only post original tweets")
         if not self.config.RUNS_PER_DAY:
             raise Exception("[TWITTER] You need to configure your twitter agent's runs per day")
 
 
     def run(self):
         def job():
-            self.respond_to_key_users()
-            if self.config.POST_MODE:
-                self.post_tweet()
+            self.run_count += 1
+            
+            # Check team users and mentions every run as requested
+            if self.config.KEY_USERS:
+                try:
+                    self.respond_to_key_users()
+                except Exception as e:
+                    logging.error(f"[TWITTER] Error responding to users: {e}")
+                    
+            if self.config.MONITOR_MENTIONS:
+                try:
+                    self.respond_to_mentions()
+                except Exception as e:
+                    logging.error(f"[TWITTER] Error responding to mentions: {e}")
+                
+            # Post original tweets at specified frequency
+            if self.config.POST_MODE and (self.run_count % self.config.POST_EVERY_N_RUNS == 0):
+                try:
+                    self.post_original_tweet()
+                except Exception as e:
+                    logging.error(f"[TWITTER] Error posting tweet: {e}")
 
         job()
 
@@ -133,12 +154,16 @@ class Twitter:
         logging.debug(f"[TWITTER] Twitter search query: {query}")
 
         # Search for tweets
-        response = self.v2api.search_recent_tweets(
-            query=query,
-            start_time=start_time,
-            tweet_fields=["created_at","author_id","conversation_id", "public_metrics"],
-            expansions=["author_id","referenced_tweets.id"]
-        )
+        try:
+            response = self.v2api.search_recent_tweets(
+                query=query,
+                start_time=start_time,
+                tweet_fields=["created_at","author_id","conversation_id", "public_metrics"],
+                expansions=["author_id","referenced_tweets.id"]
+            )
+        except tweepy.errors.TooManyRequests:
+            logging.warning(f"[TWITTER] Rate limit hit while searching tweets. Returning empty results.")
+            return {}
         logging.debug(f"[TWITTER] Twitter search results: {response}")
 
         if not response.get("data", False):
@@ -232,6 +257,10 @@ class Twitter:
     def respond_to_key_users(self):
         """Responds to tweets by key users"""
 
+        if not self.config.KEY_USERS:
+            logging.info(f"[TWITTER] No key users configured, skipping user monitoring...")
+            return
+
         logging.info(f"[TWITTER] Responding to key users...")
         relevant_conversations = self.__get_relevant_conversations()
         response_count = 0
@@ -266,6 +295,103 @@ class Twitter:
                     logging.exception(f"[TWITTER] Error responding to conversation {conversation_id}. {e}")
                 
         logging.info(f"[TWITTER] Successfully responded to relevant conversations.")
+
+
+    def respond_to_mentions(self):
+        """Responds to mentions of the bot account"""
+        
+        logging.info(f"[TWITTER] Checking for mentions...")
+        
+        try:
+            # Search for mentions of the bot
+            mention_query = f"@{self.username}"
+            start_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=self.interval)
+            
+            response = self.v2api.search_recent_tweets(
+                query=mention_query,
+                start_time=start_time,
+                tweet_fields=["created_at", "author_id", "conversation_id", "public_metrics"],
+                expansions=["author_id", "referenced_tweets.id"]
+            )
+            
+            if not response.get("data", False):
+                logging.info(f"[TWITTER] No mentions found.")
+                return
+                
+            # Create authors lookup dict
+            authors = {user["id"]: user["username"] for user in response["includes"]["users"]}
+            
+            mentions_count = 0
+            for tweet in response["data"]:
+                # Don't respond to own tweets
+                if tweet["author_id"] == self.user_id:
+                    continue
+                    
+                # Limit responses per run
+                if mentions_count >= self.config.RESPONSES_PER_RUN:
+                    break
+                    
+                author_username = authors.get(tweet["author_id"], "unknown")
+                logging.info(f"[TWITTER] Responding to mention from @{author_username}: {tweet['text']}")
+                
+                # Generate contextual response
+                mention_prompt = f"""Someone mentioned you on Twitter: "{tweet['text']}"
+                
+                Respond helpfully and authentically as a SentientAGI community member. 
+                You have deep knowledge about:
+                - SentientAGI: Building world's first open and community-built AGI
+                - GRID: Global Research and Intelligence Directory with 110+ partners
+                - Partners: Napkin, Exa, Caldo, Kaito, Messari Co-Pilot, The Graph, EigenLayer
+                - Sentient products: Dobby LLM, Model Fingerprinting, Open Deep Search
+                - $SENT token economy: Stake on artifacts, earn yield, fund open-source AI
+                - AGI as network of specialized intelligences vs monolithic models
+                - Sentient Chat: Gateway to unified intelligence
+                - Open vs closed AI systems (vs OpenAI, Anthropic, Google)
+                - Making open-source AGI monetizable and sustainable
+                
+                Answer their question or engage with their topic thoughtfully.
+                Keep it under 280 characters, be helpful and engaging. No hashtags."""
+                
+                try:
+                    response_text = self.model.query(mention_prompt)
+                    logging.info(f"[TWITTER] Generated response: {response_text}")
+                    
+                    # Post reply
+                    success, tweet_id = self.post_tweet(response_text, in_reply_to_tweet_id=tweet["id"])
+                    if success:
+                        logging.info(f"[TWITTER] Successfully replied to mention with ID: {tweet_id}")
+                        mentions_count += 1
+                    else:
+                        logging.error(f"[TWITTER] Failed to reply to mention")
+                        
+                except Exception as e:
+                    logging.exception(f"[TWITTER] Error responding to mention: {e}")
+                    
+        except tweepy.errors.TooManyRequests:
+            logging.warning(f"[TWITTER] Rate limit hit while checking mentions. Skipping this round.")
+        except Exception as e:
+            logging.exception(f"[TWITTER] Error checking mentions: {e}")
+
+
+    def post_original_tweet(self):
+        """Posts an original tweet using the model"""
+        try:
+            logging.info(f"[TWITTER] Generating original tweet...")
+            
+            # Generate tweet content using model
+            tweet_content = self.model.query(self.config.POST_PROMPT)
+            
+            logging.info(f"[TWITTER] Generated tweet: {tweet_content}")
+            
+            # Post the tweet
+            success, tweet_id = self.post_tweet(tweet_content)
+            if success:
+                logging.info(f"[TWITTER] Successfully posted original tweet with ID: {tweet_id}")
+            else:
+                logging.error(f"[TWITTER] Failed to post original tweet")
+                
+        except Exception as e:
+            logging.exception(f"[TWITTER] Error generating/posting original tweet: {e}")
 
 
     def post_tweet(self, post_text, in_reply_to_tweet_id=None, quote_tweet_id=None):
